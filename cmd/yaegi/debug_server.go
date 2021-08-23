@@ -68,6 +68,7 @@ func debugServer(arg []string) error {
 		return errors.New("missing script path")
 	}
 
+	shouldAutoImport := !noAutoImport
 	newInterp := func(opts interp.Options) (*interp.Interpreter, error) {
 		opts.GoPath = build.Default.GOPATH
 		opts.BuildTags = strings.Split(tags, ",")
@@ -104,6 +105,9 @@ func debugServer(arg []string) error {
 				return nil, err
 			}
 		}
+		if shouldAutoImport {
+			i.ImportUsed()
+		}
 
 		return i, nil
 	}
@@ -120,6 +124,7 @@ func debugServer(arg []string) error {
 		StopAtEntry:    stopAtEntry,
 		NewInterpreter: newInterp,
 		Errors:         errch,
+		SrcPath:        args[0],
 	}
 
 	var adp *dbg.Adapter
@@ -129,34 +134,11 @@ func debugServer(arg []string) error {
 			return err
 		}
 
-		opts.NewInterpreter = func(opts interp.Options) (*interp.Interpreter, error) {
-			i, err := newInterp(opts)
-			if err != nil {
-				return nil, err
-			}
-
-			if !noAutoImport {
-				i.ImportUsed()
-			}
-			return i, nil
-		}
-
 		adp = dbg.NewEvalAdapter(string(b), opts)
 	} else if src, ok := isScript(args[0]); ok {
-		opts.NewInterpreter = func(opts interp.Options) (*interp.Interpreter, error) {
-			i, err := newInterp(opts)
-			if err != nil {
-				return nil, err
-			}
-
-			if !noAutoImport {
-				i.ImportUsed()
-			}
-			return i, nil
-		}
-
 		adp = dbg.NewEvalAdapter(src, opts)
 	} else {
+		shouldAutoImport = false
 		adp = dbg.NewEvalPathAdapter(args[0], opts)
 	}
 
@@ -228,8 +210,9 @@ func debugServer(arg []string) error {
 		lf, addr := lf, c.RemoteAddr()
 		if lf != nil {
 			prefix := []byte(fmt.Sprintf("{%v}", addr))
+			ogLF := lf
 			lf = iox.WriterFunc(func(b []byte) (int, error) {
-				n, err := lf.Write(append(prefix, b...))
+				n, err := ogLF.Write(append(prefix, b...))
 				if n < len(prefix) {
 					n = 0
 				} else {

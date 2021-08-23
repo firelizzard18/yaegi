@@ -42,6 +42,7 @@ type Adapter struct {
 	ccaps   *dap.InitializeRequestArguments
 
 	interp   *interp.Interpreter
+	program  *interp.Program
 	debugger *interp.Debugger
 
 	events *events
@@ -131,6 +132,7 @@ func (a *Adapter) Initialize(s *dap.Session, ccaps *dap.InitializeRequestArgumen
 	a.session, a.ccaps = s, ccaps
 	return &dap.Capabilities{
 		SupportsConfigurationDoneRequest: dap.Bool(true),
+		SupportsFunctionBreakpoints:      dap.Bool(true),
 	}, nil
 }
 
@@ -154,13 +156,13 @@ func (a *Adapter) Process(m dap.IProtocolMessage) error {
 			}
 			a.interp = i
 
-			prog, err := a.compile(a.interp, a.arg)
+			a.program, err = a.compile(a.interp, a.arg)
 			if err == nil {
 				success = true
 				err = a.session.Event("initialized", nil)
 			} else {
 				stop = true
-				err = a.session.Event("output", &dap.OutputEventBody{
+				_ = a.session.Event("output", &dap.OutputEventBody{
 					Category: dap.Str("stderr"),
 					Output:   err.Error(),
 					Data:     err,
@@ -172,13 +174,13 @@ func (a *Adapter) Process(m dap.IProtocolMessage) error {
 				return err
 			}
 
-			a.debugger = a.interp.Debug(context.Background(), prog, func(e *interp.DebugEvent) {
+			a.debugger = a.interp.Debug(context.Background(), a.program, func(e *interp.DebugEvent) {
 				if e.Reason() == interp.DebugEnterGoRoutine {
 					err := a.session.Event("thread", &dap.ThreadEventBody{
 						Reason:   "started",
 						ThreadId: e.GoRoutine(),
 					})
-					if a.opts.Errors != nil {
+					if a.opts.Errors != nil && err != nil {
 						a.opts.Errors <- err
 					}
 					return
@@ -189,7 +191,7 @@ func (a *Adapter) Process(m dap.IProtocolMessage) error {
 						Reason:   "exited",
 						ThreadId: e.GoRoutine(),
 					})
-					if a.opts.Errors != nil {
+					if a.opts.Errors != nil && err != nil {
 						a.opts.Errors <- err
 					}
 					return
@@ -200,7 +202,7 @@ func (a *Adapter) Process(m dap.IProtocolMessage) error {
 
 				if e.Reason() == interp.DebugTerminate {
 					err := a.session.Event("terminated", nil)
-					if a.opts.Errors != nil {
+					if a.opts.Errors != nil && err != nil {
 						a.opts.Errors <- err
 					}
 					stop = true
@@ -222,7 +224,7 @@ func (a *Adapter) Process(m dap.IProtocolMessage) error {
 					body.Reason = "pause"
 				}
 				err := a.session.Event("stopped", body)
-				if a.opts.Errors != nil {
+				if a.opts.Errors != nil && err != nil {
 					a.opts.Errors <- err
 				}
 			}, &interp.DebugOptions{
@@ -236,67 +238,55 @@ func (a *Adapter) Process(m dap.IProtocolMessage) error {
 				break
 			}
 
-			path := args.Source.Path.Get()
-			if a.opts.SrcPath != "" && path == a.opts.SrcPath {
-				path = "_.go"
+			var target interp.BreakpointTarget
+			if path := args.Source.Path.Get(); path == a.opts.SrcPath {
+				target = interp.ProgramBreakpointTarget(a.program)
+			} else {
+				target = interp.PathBreakpointTarget(path)
 			}
 
-			var bp []*interp.Breakpoint
+			var req []interp.BreakpointRequest
 			if args.Breakpoints != nil {
-				bp = make([]*interp.Breakpoint, len(args.Breakpoints))
-				for i := range bp {
+				req = make([]interp.BreakpointRequest, len(args.Breakpoints))
+				for i := range req {
 					b := args.Breakpoints[i]
 					if a.ccaps.LinesStartAt1.False() {
 						b.Line++
 					}
-					if b.Column != nil && a.ccaps.ColumnsStartAt1.False() {
-						*b.Column++
-					}
 
-					bp[i] = &interp.Breakpoint{
-						Line:   b.Line,
-						Column: b.Column.GetOr(0),
-					}
+					req[i] = interp.LineBreakpoint(b.Line)
 				}
 			} else {
-				bp = make([]*interp.Breakpoint, len(args.Lines))
-				for i := range bp {
+				req = make([]interp.BreakpointRequest, len(args.Lines))
+				for i := range req {
 					l := args.Lines[i]
 					if a.ccaps.LinesStartAt1.False() {
 						l++
 					}
 
-					bp[i].Line = l
+					req[i] = interp.LineBreakpoint(l)
 				}
 			}
 
-			bp = a.debugger.SetBreakpoints(path, bp)
-
-			b := new(dap.SetBreakpointsResponseBody)
-			body = b
-			b.Breakpoints = make([]*dap.Breakpoint, len(bp))
-
-			for i, bp := range bp {
-				if bp == nil {
-					b.Breakpoints[i] = &dap.Breakpoint{Verified: false}
-					continue
-				}
-
-				if a.ccaps.LinesStartAt1.False() {
-					bp.Line--
-				}
-				if a.ccaps.ColumnsStartAt1.False() {
-					bp.Column--
-				}
-
-				b.Breakpoints[i] = &dap.Breakpoint{
-					Verified: true,
-					Line:     dap.Int(bp.Line),
-					Column:   dap.Int(bp.Column),
-				}
-			}
-
+			res := a.debugger.SetBreakpoints(target, req...)
 			success = true
+			body = &dap.SetBreakpointsResponseBody{
+				Breakpoints: a.convertBreakpoints(res),
+			}
+
+		case "setFunctionBreakpoints":
+			args := m.Arguments.(*dap.SetFunctionBreakpointsArguments)
+
+			req := make([]interp.BreakpointRequest, len(args.Breakpoints))
+			for i, bp := range args.Breakpoints {
+				req[i] = interp.FunctionBreakpoint(bp.Name)
+			}
+
+			res := a.debugger.SetBreakpoints(interp.AllBreakpointTarget(), req...)
+			success = true
+			body = &dap.SetFunctionBreakpointsResponseBody{
+				Breakpoints: a.convertBreakpoints(res),
+			}
 
 		case "configurationDone":
 			if a.opts.StopAtEntry {
@@ -374,11 +364,13 @@ func (a *Adapter) Process(m dap.IProtocolMessage) error {
 					}
 
 					src = new(dap.Source)
-					src.Path = dap.Str(pos.Filename)
-					if a.opts.SrcPath != "" && pos.Filename == "_.go" {
+					if prog := f.Program(); prog != nil && prog == a.program {
 						src.Path = dap.Str(a.opts.SrcPath)
+						src.Name = dap.Str(filepath.Base(a.opts.SrcPath))
+					} else {
+						src.Path = dap.Str(pos.Filename)
+						src.Name = dap.Str(filepath.Base(pos.Filename))
 					}
-					src.Name = dap.Str(filepath.Base(src.Path.Get()))
 				}
 
 				b.StackFrames[i] = &dap.StackFrame{
@@ -472,4 +464,28 @@ func (a *Adapter) Terminate() {
 		a.debugger.Terminate()
 		a.debugger.Wait() //nolint:errcheck
 	}
+}
+
+func (a *Adapter) convertBreakpoints(in []interp.Breakpoint) (out []*dap.Breakpoint) {
+	out = make([]*dap.Breakpoint, len(in))
+	for i, in := range in {
+		if !in.Valid {
+			out[i] = &dap.Breakpoint{Verified: false}
+			continue
+		}
+
+		if a.ccaps.LinesStartAt1.False() {
+			in.Position.Line--
+		}
+		if a.ccaps.ColumnsStartAt1.False() {
+			in.Position.Column--
+		}
+
+		out[i] = &dap.Breakpoint{
+			Verified: true,
+			Line:     dap.Int(in.Position.Line),
+			Column:   dap.Int(in.Position.Column),
+		}
+	}
+	return out
 }
