@@ -22,7 +22,7 @@ func (interp *Interpreter) Compile(src string) (*Program, error) {
 
 // CompilePath parses and compiles a Go code located at the given path.
 func (interp *Interpreter) CompilePath(path string) (*Program, error) {
-	if !isFile(path) {
+	if !isFile(interp.filesystem, path) {
 		_, err := interp.importSrc(mainID, path, NoTest)
 		return nil, err
 	}
@@ -104,7 +104,9 @@ func (interp *Interpreter) compile(src, name string, inc bool) (*Program, error)
 		root.cfgDot(dotWriter(dotCmd))
 	}
 
-	return &Program{pkgName, root, initNodes}, nil
+	prog := &Program{pkgName, root, initNodes}
+	root.prog = prog
+	return prog, nil
 }
 
 // Execute executes compiled Go code.
